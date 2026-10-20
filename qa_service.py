@@ -24,6 +24,26 @@ MAX_QUESTION_LENGTH = 2000
 logger = logging.getLogger(__name__)
 
 
+def load_categories(root=ROOT):
+    with (root / 'qa_categories.json').open(encoding='utf-8') as handle:
+        definitions = json.load(handle)['categories']
+    with (root / 'QA.csv').open(encoding='utf-8-sig', newline='') as handle:
+        questions = [row['question'] for row in csv.DictReader(handle)]
+    categories = {}
+    assigned = []
+    for definition in definitions:
+        name, entries = definition['name'], definition['questions']
+        if not isinstance(name, str) or not name.strip() or name in categories:
+            raise ValueError('Invalid or duplicate category name.')
+        if not isinstance(entries, list) or not entries or any(not isinstance(q, str) or not q for q in entries):
+            raise ValueError('Category questions must be nonempty strings.')
+        categories[name] = tuple(entries)
+        assigned.extend(entries)
+    if not categories or len(assigned) != len(set(assigned)) or set(assigned) != set(questions):
+        raise ValueError('Every QA question must be assigned to exactly one category.')
+    return categories
+
+
 class ServiceUnavailable(RuntimeError):
     """Safe, user-facing service error, without credentials or internal details."""
 
@@ -101,12 +121,18 @@ class LocalStore:
         if not np.allclose(np.linalg.norm(self.vectors, axis=1), 1, atol=1e-5):
             raise ValueError('QA vectors are not normalized.')
 
-    def search(self, vector, count=3):
-        scores = np.clip(self.vectors @ vector, -1, 1)
-        indices = np.argsort(-scores, kind='stable')[:count]
-        return [Match(**self.rows[i], similarity=float(scores[i])) for i in indices]
+    def search(self, vector, count=3, questions=None):
+        allowed = None if questions is None else frozenset(questions)
+        candidates = np.asarray([i for i, row in enumerate(self.rows) if allowed is None or row['question'] in allowed], dtype=np.int64)
+        if not len(candidates):
+            return []
+        scores = np.clip(self.vectors[candidates] @ vector, -1, 1)
+        ranked = np.argsort(-scores, kind='stable')[:count]
+        return [Match(**self.rows[candidates[i]], similarity=float(scores[i])) for i in ranked]
 
-    def exact(self, question):
+    def exact(self, question, questions=None):
+        if questions is not None and question not in questions:
+            return None
         return next((Match(**r, similarity=1.0) for r in self.rows if r['question'].strip() == question), None)
 
 
@@ -120,13 +146,20 @@ class SupabaseStore:
         if not self.key:
             raise ValueError('SUPABASE_SERVICE_ROLE_KEY is required.')
 
-    def exact(self, question):
+    def exact(self, question, questions=None):
         # Retrieval is delegated to the existing match_qa RPC in this mode.
         return None
 
-    def search(self, vector, count=3):
-        body = json.dumps(dict(query_embedding=vector.tolist(), match_count=count, match_threshold=-1.0)).encode()
-        request = Request(self.url + '/rest/v1/rpc/match_qa', data=body, method='POST', headers={
+    def search(self, vector, count=3, questions=None):
+        payload = dict(query_embedding=vector.tolist(), match_count=count, match_threshold=-1.0)
+        endpoint = 'match_qa'
+        if questions is not None:
+            if not questions:
+                return []
+            payload['category_questions'] = list(questions)
+            endpoint = 'match_qa_in_category'
+        body = json.dumps(payload).encode()
+        request = Request(self.url + '/rest/v1/rpc/' + endpoint, data=body, method='POST', headers={
             'Content-Type': 'application/json', 'apikey': self.key, 'Authorization': 'Bearer ' + self.key,
         })
         try:
@@ -137,6 +170,8 @@ class SupabaseStore:
             matches = [Match(question=r['question'], answer=r['answer'], similarity=float(r['similarity'])) for r in data]
             if any(not isinstance(m.question, str) or not isinstance(m.answer, str) or not np.isfinite(m.similarity) for m in matches):
                 raise ValueError('Invalid RPC match.')
+            if questions is not None:
+                matches = [m for m in matches if m.question in questions]
             return sorted(matches, key=lambda m: m.similarity, reverse=True)
         except (HTTPError, URLError, TimeoutError, ValueError, KeyError, TypeError) as exc:
             # Do not display or log response bodies, URLs, headers or service keys.
@@ -153,17 +188,24 @@ class QAService:
         if backend not in ('local', 'supabase'):
             raise ValueError('QA_BACKEND must be local or supabase.')
         self.store = store if store is not None else (LocalStore() if backend == 'local' else SupabaseStore())
+        self.categories = load_categories()
         self.embedder = embedder if embedder is not None else Embedder()
 
-    def answer(self, question):
+    def answer(self, question, category=None):
         question = question.strip()
         if not question:
             return '請輸入您想詢問的問題。', ''
         if len(question) > MAX_QUESTION_LENGTH:
             return f'問題請控制在 {MAX_QUESTION_LENGTH} 字以內，並描述主要狀況或錯誤訊息。', ''
-        exact = self.store.exact(question)
-        matches = [exact] if exact else self.store.search(self.embedder.encode(question))
+        if category is not None and category not in self.categories:
+            return '請先選擇有效的問題分類，再提出問題。', ''
+        allowed = self.categories[category] if category is not None else None
+        exact = self.store.exact(question, questions=allowed)
+        matches = [exact] if exact else self.store.search(self.embedder.encode(question), questions=allowed)
+        if allowed is not None:
+            matches = [m for m in matches if m.question in allowed]
         if not matches or matches[0].similarity < self.threshold:
-            return '目前知識庫沒有找到足夠相關的答案。請補充 FCCL 銅箔檢測系統的操作、缺陷類型或錯誤訊息，或聯絡人工客服。', ''
+            scope = f'「{category}」分類' if category else '知識庫'
+            return f'目前{scope}沒有找到足夠相關的答案。請補充問題描述、切換適合的分類，或聯絡人工客服。', ''
         references = '\n\n'.join(f'{i}. {match.question}' for i, match in enumerate(matches, 1) if match.similarity >= self.threshold)
         return matches[0].answer, references
